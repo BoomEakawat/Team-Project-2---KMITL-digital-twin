@@ -9,20 +9,40 @@ DB_PATH = r"C:\Users\Boom\Documents\_University\_Classroom\2nd YEAR\2.2\Team Pro
 
 # --- ส่วนตั้งค่า Google Sheets ---
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-# มั่นใจว่าไฟล์ creds.json อยู่โฟลเดอร์เดียวกับไฟล์นี้
 CREDS_FILE = "creds.json" 
-SHEET_NAME = "IoT_Data" # แก้ให้ตรงกับชื่อไฟล์ Google Sheet ของคุณ
+SHEET_NAME = "IoT_Data"
 
-def update_google_sheets(now, min_v, max_v):
+# --- ส่วนของ Buffer (ตัวพักข้อมูล) ---
+data_buffer = [] 
+BUFFER_SIZE = 10 
+
+def sync_to_sheets_batch(rows):
     try:
         creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
         client = gspread.authorize(creds)
-        # เปิด Sheet และอัปเดตแถวที่ 2 (คอลัมน์ A, B, C)
         sheet = client.open(SHEET_NAME).sheet1
-        sheet.update('A2:C2', [[now, min_v, max_v]])
-        print(f"☁️ Synced to Sheets: Now={now}")
+        
+        # 1. ส่งข้อมูลชุดใหม่ไปต่อท้ายก่อน (Buffer 10 แถว)
+        sheet.append_rows(rows)
+        
+        # 2. นับจำนวนแถวทั้งหมดที่มีใน Sheet ตอนนี้
+        all_values = sheet.get_all_values()
+        current_rows = len(all_values)
+        
+        # 3. ถ้าเกิน 201 แถว (หัวตาราง 1 + ข้อมูล 200)
+        if current_rows > 288:
+            # คำนวณว่าเกินมาเท่าไหร่
+            excess = current_rows - 288
+            
+            # สั่งลบแถวที่ 2 (ข้อมูลเก่าสุด) แบบ "ลบทีเดียวหลายแถวรวด" 
+            # เช่น ถ้าเกินมา 10 แถว จะลบแถวที่ 2 ถึง 11 ในคำสั่งเดียว
+            sheet.delete_rows(2, 2 + excess - 1)
+            print(f"🗑️ Deleted {excess} old rows. Maintained exactly 200 entries.")
+        
+        print(f"☁️ Successfully synced {len(rows)} rows to Google Sheets!")
+        
     except Exception as e:
-        print(f"❌ Sheets Error: {e}")
+        print(f"❌ Sheets Batch Error: {e}")
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -40,14 +60,20 @@ def init_db():
 
 @app.route('/data', methods=['POST'])
 def receive_data():
+    global data_buffer
     data = request.get_json()
     if data:
         now = data.get("x")
         min_val = data.get("y")
         max_val = data.get("z")
+        
+        # สำหรับ Database
         ts = datetime.datetime.now().isoformat()
+        
+        # สำหรับ Google Sheets (แก้ Format วันที่แล้ว!)
+        ts_display = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 1. บันทึกลง SQLite (เหมือนเดิม)
+        # 1. บันทึกลง SQLite
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('INSERT INTO "water distance" VALUES (?,?,?,?)',
@@ -55,10 +81,15 @@ def receive_data():
         conn.commit()
         conn.close()
 
-        # 2. ส่งข้อมูลไป Google Sheets (เพิ่มมาใหม่)
-        update_google_sheets(now, min_val, max_val)
+        # 2. เก็บข้อมูลลง Buffer (ใช้วันที่ที่แก้แล้ว)
+        data_buffer.append([ts_display, now, min_val, max_val])
 
-        print(f"✅ Saved: Now={now}, Min={min_val}, Max={max_val}")
+        # 3. ตรวจสอบว่า Buffer เต็มหรือยัง
+        if len(data_buffer) >= BUFFER_SIZE:
+            sync_to_sheets_batch(data_buffer)
+            data_buffer = [] # ล้าง Buffer
+
+        print(f"✅ Saved to DB: Now={now} (Buffer: {len(data_buffer)}/{BUFFER_SIZE})")
     return "OK"
 
 if __name__ == '__main__':
